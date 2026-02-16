@@ -1,0 +1,9 @@
+[package]
+name = "swr-rs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+sdl2 = "0.38"
+nalgebra-glm = "0.20.0"
+crossbeam = "0.8.4"
