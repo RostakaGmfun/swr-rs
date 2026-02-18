@@ -1,10 +1,8 @@
 use nalgebra_glm as glm;
 use std::alloc::{Layout, alloc_zeroed, dealloc};
-use std::io::Write;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::Duration;
 
 fn triangle_area(a: glm::Vec2, b: glm::Vec2, c: glm::Vec2) -> f32 {
     // Shoelace formula
@@ -66,9 +64,6 @@ pub struct Framebuffer {
     width: u32,
     height: u32,
 
-    tile_w: u32,
-    tile_h: u32,
-
     color_buffer: AlignedBuffer<u8>,
     depth_buffer: AlignedBuffer<f32>,
 }
@@ -76,7 +71,7 @@ pub struct Framebuffer {
 impl Framebuffer {
     const ALIGNMENT: usize = 64;
 
-    pub fn new(width: u32, height: u32, tile_w: u32, tile_h: u32) -> Self {
+    pub fn new(width: u32, height: u32) -> Self {
         let color_buffer =
             AlignedBuffer::new((width * height * 3).try_into().unwrap(), Self::ALIGNMENT);
         let depth_buffer =
@@ -85,9 +80,6 @@ impl Framebuffer {
         Self {
             width,
             height,
-
-            tile_w,
-            tile_h,
 
             color_buffer,
             depth_buffer,
@@ -186,23 +178,20 @@ struct DrawCmdPayload {
 
 enum DrawCallCmd {
     Draw(DrawCmdPayload),
-    Print(String),
 }
 
 pub struct Barrier {
     counter: AtomicUsize,
     done_mutex: Mutex<()>,
     done_cond: Condvar,
-    name: &'static str,
 }
 
 impl Barrier {
-    pub fn new(name: &'static str) -> Self {
+    pub fn new() -> Self {
         Self {
             counter: AtomicUsize::new(0),
             done_mutex: Mutex::new(()),
             done_cond: Condvar::new(),
-            name: name,
         }
     }
 
@@ -223,32 +212,6 @@ impl Barrier {
         while self.counter.load(Ordering::SeqCst) != 0 {
             guard = self.done_cond.wait(guard).unwrap();
         }
-    }
-
-    pub fn wait_timeout(&self, timeout: Duration) -> bool {
-        let mut guard = self.done_mutex.lock().unwrap();
-        let start = std::time::Instant::now();
-
-        while self.counter.load(Ordering::SeqCst) != 0 {
-            let elapsed = start.elapsed();
-            if elapsed >= timeout {
-                return false;
-            }
-
-            let remaining = timeout - elapsed;
-            let (g, result) = self.done_cond.wait_timeout(guard, remaining).unwrap();
-            guard = g;
-
-            if result.timed_out() {
-                return false;
-            }
-        }
-
-        true
-    }
-
-    fn num_pending(&self) -> usize {
-        return self.counter.load(Ordering::SeqCst);
     }
 }
 
@@ -271,11 +234,6 @@ impl TriangleBatch {
             frag_shader: None,
             triangles: Vec::with_capacity(DrawCallWorker::TRI_BATCH_MAX_SIZE),
         }
-    }
-
-    fn clear(&mut self) {
-        self.triangles.clear();
-        self.frag_shader = None;
     }
 }
 
@@ -313,22 +271,6 @@ impl Tile {
             depth_ptr: fb.get_depth_ptr(),
             fb_width: fb.width(),
         }
-    }
-
-    fn x(&self) -> u32 {
-        self.x
-    }
-
-    fn y(&self) -> u32 {
-        self.y
-    }
-
-    fn w(&self) -> u32 {
-        self.w
-    }
-
-    fn h(&self) -> u32 {
-        self.h
     }
 
     fn get_color_row(&self, row_num: u32) -> &mut [u8] {
@@ -440,7 +382,7 @@ impl TileScheduler {
         let num_tiles = tiles_per_row(fb.width(), tile_w) * tiles_per_col(fb.height(), tile_h);
         let tile_threads = Mutex::new(Vec::with_capacity(Self::TILE_THREAD_COUNT));
         let (tile_queue, tile_queue_rx) = crossbeam::channel::bounded(Self::TILE_QUEUE_LEN);
-        let tile_queue_barrier = Arc::new(Barrier::new("tqb"));
+        let tile_queue_barrier = Arc::new(Barrier::new());
         let mut tiles = Vec::with_capacity(num_tiles as usize);
 
         for y in 0..tiles_per_col(fb.height(), tile_h) {
@@ -518,10 +460,6 @@ impl TileScheduler {
 
     fn wait(&self) {
         self.tile_queue_barrier.wait()
-    }
-
-    fn wait_timeout(&self, timeout: std::time::Duration) -> bool {
-        self.tile_queue_barrier.wait_timeout(timeout)
     }
 }
 
@@ -694,9 +632,9 @@ impl Pipeline {
 
     pub fn new(width: u32, height: u32, tile_w: u32, tile_h: u32) -> Self {
         let mut threads = Vec::with_capacity(Self::DRAW_CALL_THREAD_COUNT);
-        let fb = Framebuffer::new(width, height, tile_w, tile_h);
+        let fb = Framebuffer::new(width, height);
         let (draw_call_queue, receiver) = crossbeam::channel::bounded(Self::DRAW_CALL_QUEUE_LEN);
-        let draw_call_barrier = Arc::new(Barrier::new("dqb"));
+        let draw_call_barrier = Arc::new(Barrier::new());
         let tile_scheduler = TileScheduler::new(&fb, tile_w, tile_h);
 
         for i in 0..Self::DRAW_CALL_THREAD_COUNT {
@@ -713,13 +651,6 @@ impl Pipeline {
                         match rx.recv() {
                             Ok(DrawCallCmd::Draw(cmd)) => {
                                 draw_call_worker.handle(&cmd);
-                                done_barrier.dec()
-                            }
-
-                            Ok(DrawCallCmd::Print(msg)) => {
-                                thread::sleep(Duration::from_millis(1));
-                                println!("Job: {}", msg);
-                                std::io::stdout().flush().unwrap();
                                 done_barrier.dec()
                             }
 
@@ -751,13 +682,6 @@ impl Pipeline {
         }
     }
 
-    pub fn test(&self, msg: &str) {
-        self.draw_call_barrier.inc();
-        self.draw_call_queue
-            .send(DrawCallCmd::Print(msg.to_string()))
-            .unwrap();
-    }
-
     pub fn framebuffer(&self) -> &Framebuffer {
         &self.framebuffer
     }
@@ -782,17 +706,7 @@ impl Pipeline {
     }
 
     pub fn end_frame(&mut self) {
-        if !self
-            .draw_call_barrier
-            .wait_timeout(std::time::Duration::from_millis(1000))
-        {
-            panic!("dc barrier timeout");
-        }
-        if !self
-            .tile_scheduler
-            .wait_timeout(std::time::Duration::from_millis(1000))
-        {
-            panic!("ts barrier timeout");
-        }
+        self.draw_call_barrier.wait();
+        self.tile_scheduler.wait();
     }
 }
