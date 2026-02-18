@@ -122,7 +122,8 @@ impl Framebuffer {
     }
 }
 
-pub type Vertex = glm::Vec3;
+pub struct Vertex(pub glm::Vec3, pub glm::Vec3);
+
 pub type FSOutput = glm::Vec3;
 
 pub struct VertexBuffer {

@@ -5,7 +5,6 @@ use sdl2::pixels::PixelFormatEnum;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-mod obj;
 mod swr;
 
 const WIDTH: u32 = 1280;
@@ -18,13 +17,12 @@ struct SimpleVS {
 
 impl swr::VertexShader for SimpleVS {
     fn shade(&self, vin: &swr::Vertex, vout: &mut swr::VSOutput) {
-        let clip_space = self.mvp * glm::vec4(vin.x, vin.y, vin.z, 1f32);
+        let clip_space = self.mvp * glm::vec4(vin.0.x, vin.0.y, vin.0.z, 1f32);
         vout.ndc_position = glm::vec4_to_vec3(&clip_space) / clip_space.w;
 
-        let light_dir = glm::normalize(&glm::vec3(1f32, 1f32, 1f32)); // arbitrary light
-        let fake_normal = glm::normalize(&vin); // treat position as normal
+        let light_dir = glm::normalize(&glm::vec3(1f32, 1f32, 1f32));
 
-        let mut diffuse = glm::dot(&fake_normal, &light_dir);
+        let mut diffuse = glm::dot(&vin.1, &light_dir);
         let ambient = 0.2f32;
         diffuse = ambient + (1f32 - ambient) * diffuse;
 
@@ -40,6 +38,26 @@ impl swr::FragShader for SimpleFS {
     fn shade(&self, fin: &swr::FSInput, fout: &mut swr::FSOutput) {
         *fout = glm::vec3(fin.varyings[0], fin.varyings[1], fin.varyings[2]);
     }
+}
+
+impl From<obj::Vertex> for swr::Vertex {
+    fn from(v: obj::Vertex) -> Self {
+        swr::Vertex(
+            glm::Vec3::from(v.position),
+            glm::normalize(&glm::Vec3::from(v.normal)),
+        )
+    }
+}
+
+fn obj_to_swr(model: obj::Obj) -> (Vec<swr::Vertex>, Vec<[u16; 3]>) {
+    let verts = model.vertices.into_iter().map(Into::into).collect();
+    let indices = model
+        .indices
+        .chunks_exact(3)
+        .map(|i| [i[0], i[1], i[2]])
+        .collect::<Vec<_>>();
+
+    (verts, indices)
 }
 
 fn main() -> Result<(), String> {
@@ -68,7 +86,8 @@ fn main() -> Result<(), String> {
 
     let mut event_pump = sdl_context.event_pump().unwrap();
 
-    let (verts, indices) = obj::load_obj("./data/suzanne.obj").unwrap();
+    let input = std::io::BufReader::new(std::fs::File::open("data/suzanne.obj").unwrap());
+    let (verts, indices) = obj_to_swr(obj::load_obj(input).unwrap());
 
     let camera_pos = glm::vec3(0f32, 0f32, -20f32);
     let camera_target = glm::vec3(0f32, 0f32, 0f32);
@@ -153,7 +172,7 @@ fn main() -> Result<(), String> {
         let vs = Arc::new(SimpleVS {
             mvp: proj * view * model,
             color: glm::vec3(1f32, 1f32, 1f32),
-        }); // TODO: optimize this later, we don't want to allocate every iteration?
+        }); // TODO: optimize this later, we don't want to allocate on every frame?
 
         pipeline.begin_frame();
 
