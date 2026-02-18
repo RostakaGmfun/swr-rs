@@ -12,6 +12,7 @@ const HEIGHT: u32 = 720;
 
 struct SimpleVS {
     pub mvp: glm::Mat4,
+    pub light_dir: glm::Vec3,
     pub color: glm::Vec3,
 }
 
@@ -20,9 +21,7 @@ impl swr::VertexShader for SimpleVS {
         let clip_space = self.mvp * glm::vec4(vin.0.x, vin.0.y, vin.0.z, 1f32);
         vout.ndc_position = glm::vec4_to_vec3(&clip_space) / clip_space.w;
 
-        let light_dir = glm::normalize(&glm::vec3(1f32, 1f32, 1f32));
-
-        let mut diffuse = glm::dot(&vin.1, &light_dir);
+        let mut diffuse = glm::dot(&vin.1, &self.light_dir);
         let ambient = 0.2f32;
         diffuse = ambient + (1f32 - ambient) * diffuse;
 
@@ -171,6 +170,7 @@ fn main() -> Result<(), String> {
         model = glm::rotate(&model, rot_y, &glm::vec3(0.0, 1.0, 0.0));
         let vs = Arc::new(SimpleVS {
             mvp: proj * view * model,
+            light_dir: glm::normalize(&(glm::inverse(&model) * glm::vec4(1.0, 1.0, -1.0, 0.0)).xyz()),
             color: glm::vec3(1f32, 1f32, 1f32),
         }); // TODO: optimize this later, we don't want to allocate on every frame?
 
