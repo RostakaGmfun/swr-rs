@@ -18,14 +18,15 @@ fn tiles_per_col(fb_h: u32, tile_h: u32) -> u32 {
     fb_h / tile_h
 }
 
-pub struct AlignedBuffer<T> {
+pub struct RawBuffer<T> {
     ptr: *mut T,
     len: usize,
-    layout: Layout,
+    layout: Option<Layout>,
+    is_owned: bool,
 }
 
-impl<T> AlignedBuffer<T> {
-    fn new(len: usize, align: usize) -> Self {
+impl<T> RawBuffer<T> {
+    fn new_aligned(len: usize, align: usize) -> Self {
         let size = len * std::mem::size_of::<T>();
         let layout = Layout::from_size_align(size, align).unwrap();
 
@@ -35,7 +36,21 @@ impl<T> AlignedBuffer<T> {
                 std::alloc::handle_alloc_error(layout);
             }
 
-            Self { ptr, len, layout }
+            Self {
+                ptr,
+                len,
+                layout: Some(layout),
+                is_owned: true,
+            }
+        }
+    }
+
+    fn new_from_mut_slice(s: &mut [T]) -> Self {
+        Self {
+            ptr: s.as_mut_ptr(),
+            len: s.len(),
+            layout: None,
+            is_owned: false,
         }
     }
 
@@ -52,10 +67,14 @@ impl<T> AlignedBuffer<T> {
     }
 }
 
-impl<T> Drop for AlignedBuffer<T> {
+impl<T> Drop for RawBuffer<T> {
     fn drop(&mut self) {
-        unsafe {
-            dealloc(self.ptr.cast(), self.layout);
+        if self.is_owned
+            && let Some(layout) = self.layout
+        {
+            unsafe {
+                dealloc(self.ptr.cast(), layout);
+            }
         }
     }
 }
@@ -63,23 +82,45 @@ impl<T> Drop for AlignedBuffer<T> {
 pub struct Framebuffer {
     width: u32,
     height: u32,
+    color_row_stride: u32,
 
-    color_buffer: AlignedBuffer<u8>,
-    depth_buffer: AlignedBuffer<f32>,
+    color_buffer: RawBuffer<u8>,
+    depth_buffer: RawBuffer<f32>,
 }
 
 impl Framebuffer {
     const ALIGNMENT: usize = 64;
 
-    pub fn new(width: u32, height: u32) -> Self {
-        let color_buffer =
-            AlignedBuffer::new((width * height * 3).try_into().unwrap(), Self::ALIGNMENT);
+    pub fn new_with_color_buffer(
+        color_buffer: &mut [u8],
+        row_stride: u32,
+        width: u32,
+        height: u32,
+    ) -> Self {
+        let color_buffer = RawBuffer::new_from_mut_slice(color_buffer);
         let depth_buffer =
-            AlignedBuffer::new((width * height).try_into().unwrap(), Self::ALIGNMENT);
+            RawBuffer::new_aligned((width * height).try_into().unwrap(), Self::ALIGNMENT);
 
         Self {
             width,
             height,
+            color_row_stride: row_stride,
+
+            color_buffer,
+            depth_buffer,
+        }
+    }
+
+    pub fn new(width: u32, height: u32) -> Self {
+        let color_buffer =
+            RawBuffer::new_aligned((width * height * 3).try_into().unwrap(), Self::ALIGNMENT);
+        let depth_buffer =
+            RawBuffer::new_aligned((width * height).try_into().unwrap(), Self::ALIGNMENT);
+
+        Self {
+            width,
+            height,
+            color_row_stride: width * 3,
 
             color_buffer,
             depth_buffer,
@@ -103,6 +144,10 @@ impl Framebuffer {
 
     pub fn height(&self) -> u32 {
         self.height
+    }
+
+    pub fn color_row_stride(&self) -> u32 {
+        self.color_row_stride
     }
 
     fn get_color_ptr(&self) -> *mut u8 {
@@ -249,7 +294,8 @@ struct Tile {
 
     color_ptr: *mut u8,
     depth_ptr: *mut f32,
-    fb_width: u32,
+    color_row_stride: u32,
+    depth_row_stride: u32,
 }
 
 impl Tile {
@@ -269,7 +315,8 @@ impl Tile {
 
             color_ptr: fb.get_color_ptr(),
             depth_ptr: fb.get_depth_ptr(),
-            fb_width: fb.width(),
+            color_row_stride: fb.color_row_stride(),
+            depth_row_stride: fb.width(),
         }
     }
 
@@ -277,8 +324,8 @@ impl Tile {
         unsafe {
             std::slice::from_raw_parts_mut(
                 self.color_ptr
-                    .add(((self.x + (self.y + row_num) * self.fb_width) * 3) as usize),
-                self.w as usize * 3,
+                    .add((self.x * 4 + (self.y + row_num) * self.color_row_stride) as usize),
+                self.w as usize * 4,
             )
         }
     }
@@ -287,7 +334,7 @@ impl Tile {
         unsafe {
             std::slice::from_raw_parts_mut(
                 self.depth_ptr
-                    .add((self.x + (self.y + row_num) * self.fb_width) as usize),
+                    .add((self.x + (self.y + row_num) * self.depth_row_stride) as usize),
                 self.w as usize,
             )
         }
@@ -354,9 +401,10 @@ impl Tile {
                     let mut fout = glm::vec3(0f32, 0f32, 0f32);
                     frag_shader.shade(&fin, &mut fout);
                     fout = glm::clamp(&fout, 0f32, 1f32);
-                    color_row[(x * 3) as usize + 0] = (fout.x * 255f32) as u8;
-                    color_row[(x * 3) as usize + 1] = (fout.y * 255f32) as u8;
-                    color_row[(x * 3) as usize + 2] = (fout.z * 255f32) as u8;
+                    color_row[(x * 4) as usize + 0] = (fout.z * 255f32) as u8;
+                    color_row[(x * 4) as usize + 1] = (fout.y * 255f32) as u8;
+                    color_row[(x * 4) as usize + 2] = (fout.x * 255f32) as u8;
+                    //color_row[(x * 4) as usize + 3] = 0 as u8;
                     depth_row[x as usize] = depth;
                 }
             }
@@ -630,9 +678,10 @@ impl Pipeline {
     const DRAW_CALL_QUEUE_LEN: usize = 32;
     const DRAW_CALL_THREAD_COUNT: usize = 2;
 
-    pub fn new(width: u32, height: u32, tile_w: u32, tile_h: u32) -> Self {
+    pub fn new_with_framebuffer(fb: Framebuffer, tile_w: u32, tile_h: u32) -> Self {
+        let width = fb.width();
+        let height = fb.height();
         let mut threads = Vec::with_capacity(Self::DRAW_CALL_THREAD_COUNT);
-        let fb = Framebuffer::new(width, height);
         let (draw_call_queue, receiver) = crossbeam::channel::bounded(Self::DRAW_CALL_QUEUE_LEN);
         let draw_call_barrier = Arc::new(Barrier::new());
         let tile_scheduler = TileScheduler::new(&fb, tile_w, tile_h);
@@ -672,6 +721,10 @@ impl Pipeline {
             draw_call_barrier: draw_call_barrier,
             tile_scheduler: tile_scheduler,
         }
+    }
+
+    pub fn new(width: u32, height: u32, tile_w: u32, tile_h: u32) -> Self {
+        Self::new_with_framebuffer(Framebuffer::new(width, height), tile_w, tile_h)
     }
 
     pub fn stop(self) {

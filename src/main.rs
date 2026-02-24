@@ -69,21 +69,27 @@ fn main() -> Result<(), String> {
         .build()
         .unwrap();
 
-    let mut canvas = window
-        .into_canvas()
-        .software()
-        .build()
-        .unwrap();
-
-    let texture_creator = canvas.texture_creator();
-
-    let mut texture = texture_creator
-        .create_texture_streaming(PixelFormatEnum::RGB24, WIDTH, HEIGHT)
-        .unwrap();
-
-    let mut pipeline = swr::Pipeline::new(WIDTH, HEIGHT, WIDTH / 5, HEIGHT / 5);
-
     let mut event_pump = sdl_context.event_pump().unwrap();
+
+    let mut surface = window.surface(&event_pump).unwrap();
+
+    let surface_pitch = surface.pitch();
+    println!(
+        "Surface: pitch {}, rect {:?} {:?}",
+        surface_pitch,
+        surface.rect(),
+        surface.pixel_format_enum()
+    );
+
+    let framebuffer = swr::Framebuffer::new_with_color_buffer(
+        surface.without_lock_mut().unwrap(),
+        surface_pitch,
+        WIDTH,
+        HEIGHT,
+    );
+    surface.finish();
+
+    let mut pipeline = swr::Pipeline::new_with_framebuffer(framebuffer, WIDTH / 32, HEIGHT / 32);
 
     let input = std::io::BufReader::new(std::fs::File::open("data/suzanne.obj").unwrap());
     let (verts, indices) = obj_to_swr(obj::load_obj(input).unwrap());
@@ -110,6 +116,7 @@ fn main() -> Result<(), String> {
 
     let mut frame_count: u32 = 0;
     let mut last_fps_time = Instant::now();
+    let mut draw_secs = 0f64;
 
     let mut mb_down = false;
     let mut last_mouse_x = 0;
@@ -170,26 +177,22 @@ fn main() -> Result<(), String> {
         model = glm::rotate(&model, rot_y, &glm::vec3(0.0, 1.0, 0.0));
         let vs = Arc::new(SimpleVS {
             mvp: proj * view * model,
-            light_dir: glm::normalize(&(glm::inverse(&model) * glm::vec4(1.0, 1.0, -1.0, 0.0)).xyz()),
+            light_dir: glm::normalize(
+                &(glm::inverse(&model) * glm::vec4(1.0, 1.0, -1.0, 0.0)).xyz(),
+            ),
             color: glm::vec3(1f32, 1f32, 1f32),
         }); // TODO: optimize this later, we don't want to allocate on every frame?
 
+        let begin_draw = Instant::now();
         pipeline.begin_frame();
 
         pipeline.draw(mesh.clone(), vs.clone(), fs.clone());
 
         pipeline.end_frame();
+        draw_secs += begin_draw.elapsed().as_secs_f64();
 
-        texture
-            .update(
-                None,
-                pipeline.framebuffer().get_color_buffer(),
-                (WIDTH * 3) as usize,
-            )
-            .unwrap();
-
-        canvas.copy(&texture, None, None).unwrap();
-        canvas.present();
+        let mut surface = window.surface(&event_pump).unwrap();
+        surface.update_window();
 
         frame_count += 1;
 
@@ -197,8 +200,13 @@ fn main() -> Result<(), String> {
         if elapsed >= Duration::from_secs(1) {
             let avg_frame_ms = (elapsed.as_secs_f64() * 1000.0) / frame_count as f64;
             let fps = frame_count as f64 / elapsed.as_secs_f64();
+            let avg_draw_ms = (draw_secs * 1000.0) / frame_count as f64;
+            draw_secs = 0f64;
 
-            println!("FPS: {:.2}, avg frame: {:.3} ms", fps, avg_frame_ms);
+            println!(
+                "FPS: {:.2}, avg frame: {:.3} ms, avg draw: {:.3} ms",
+                fps, avg_frame_ms, avg_draw_ms
+            );
 
             frame_count = 0;
             last_fps_time = Instant::now();
