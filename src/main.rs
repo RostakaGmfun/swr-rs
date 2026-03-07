@@ -1,7 +1,6 @@
 use nalgebra_glm as glm;
 use sdl2::event::Event;
 use sdl2::keyboard::Keycode;
-use sdl2::pixels::PixelFormatEnum;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -121,9 +120,9 @@ fn main() -> Result<(), String> {
     let mut mb_down = false;
     let mut last_mouse_x = 0;
     let mut last_mouse_y = 0;
-    let mut rot_x = 0f32;
+    let mut rot_x = std::f32::consts::PI as f32;
     let mut rot_y = 0f32;
-    let mut scale = 1f32;
+    let mut scale = 10f32;
 
     'running: loop {
         for event in event_pump.poll_iter() {
@@ -184,6 +183,7 @@ fn main() -> Result<(), String> {
         }); // TODO: optimize this later, we don't want to allocate on every frame?
 
         let begin_draw = Instant::now();
+        let surface = window.surface(&event_pump).unwrap();
         pipeline.begin_frame();
 
         pipeline.draw(mesh.clone(), vs.clone(), fs.clone());
@@ -191,7 +191,6 @@ fn main() -> Result<(), String> {
         pipeline.end_frame();
         draw_secs += begin_draw.elapsed().as_secs_f64();
 
-        let mut surface = window.surface(&event_pump).unwrap();
         surface.update_window();
 
         frame_count += 1;
