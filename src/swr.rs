@@ -82,60 +82,27 @@ impl<T> Drop for RawBuffer<T> {
 pub struct Framebuffer {
     width: u32,
     height: u32,
-    color_row_stride: u32,
-
-    color_buffer: RawBuffer<u8>,
     depth_buffer: RawBuffer<f32>,
 }
 
 impl Framebuffer {
     const ALIGNMENT: usize = 64;
 
-    pub fn new_with_color_buffer(
-        color_buffer: &mut [u8],
-        row_stride: u32,
-        width: u32,
-        height: u32,
-    ) -> Self {
-        let color_buffer = RawBuffer::new_from_mut_slice(color_buffer);
-        let depth_buffer =
-            RawBuffer::new_aligned((width * height).try_into().unwrap(), Self::ALIGNMENT);
-
-        Self {
-            width,
-            height,
-            color_row_stride: row_stride,
-
-            color_buffer,
-            depth_buffer,
-        }
-    }
-
     pub fn new(width: u32, height: u32) -> Self {
-        let color_buffer =
-            RawBuffer::new_aligned((width * height * 3).try_into().unwrap(), Self::ALIGNMENT);
         let depth_buffer =
             RawBuffer::new_aligned((width * height).try_into().unwrap(), Self::ALIGNMENT);
 
         Self {
             width,
             height,
-            color_row_stride: width * 3,
-
-            color_buffer,
             depth_buffer,
         }
     }
 
-    fn clear(&mut self) {
+    fn clear_depth(&mut self) {
         unsafe {
-            std::ptr::write_bytes(self.color_buffer.as_mut_ptr(), 0, self.color_buffer.len());
             std::ptr::write_bytes(self.depth_buffer.as_mut_ptr(), 0, self.depth_buffer.len());
         }
-    }
-
-    pub fn get_color_buffer(&self) -> &[u8] {
-        self.color_buffer.as_slice()
     }
 
     pub fn width(&self) -> u32 {
@@ -144,14 +111,6 @@ impl Framebuffer {
 
     pub fn height(&self) -> u32 {
         self.height
-    }
-
-    pub fn color_row_stride(&self) -> u32 {
-        self.color_row_stride
-    }
-
-    fn get_color_ptr(&self) -> *mut u8 {
-        self.color_buffer.as_mut_ptr()
     }
 
     fn get_depth_ptr(&self) -> *mut f32 {
@@ -313,9 +272,9 @@ impl Tile {
             w,
             h,
 
-            color_ptr: fb.get_color_ptr(),
+            color_ptr: std::ptr::null_mut(),
             depth_ptr: fb.get_depth_ptr(),
-            color_row_stride: fb.color_row_stride(),
+            color_row_stride: 0,
             depth_row_stride: fb.width(),
         }
     }
@@ -341,12 +300,28 @@ impl Tile {
     }
 
     fn process_triangle_batch(&self, batch: TriangleBatch) {
+        assert_ne!(self.color_ptr, std::ptr::null_mut());
+        assert_ne!(self.color_row_stride, 0);
         let frag_shader = match batch.frag_shader {
             Some(f) => f,
             None => panic!("expected frag shader"),
         };
         for t in batch.triangles {
             self.process_triangle(&t, &frag_shader);
+        }
+    }
+
+    fn drain_tile_queue(&self) {
+        loop {
+            match self.receiver.try_recv() {
+                Ok(job) => {
+                    self.process_triangle_batch(job);
+                    if self.job_counter.fetch_sub(1, Ordering::AcqRel) == 1 {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
         }
     }
 
@@ -465,20 +440,7 @@ impl TileScheduler {
                                     }
                                 };
                                 let tile = &scheduler.tiles[tile_id as usize];
-
-                                loop {
-                                    match tile.receiver.try_recv() {
-                                        Ok(job) => {
-                                            tile.process_triangle_batch(job);
-                                            if tile.job_counter.fetch_sub(1, Ordering::AcqRel) == 1
-                                            {
-                                                break;
-                                            }
-                                        }
-                                        Err(_) => break,
-                                    }
-                                }
-
+                                tile.drain_tile_queue();
                                 done_barrier.dec();
                             }
                             Err(_) => break,
@@ -508,6 +470,10 @@ impl TileScheduler {
 
     fn wait(&self) {
         self.tile_queue_barrier.wait()
+    }
+
+    fn set_framebuffer(&self, framebuffer: Option<&mut [u8]>) {
+
     }
 }
 
@@ -672,13 +638,20 @@ pub struct Pipeline {
     draw_call_queue: crossbeam::channel::Sender<DrawCallCmd>,
     draw_call_barrier: Arc<Barrier>,
     tile_scheduler: Arc<TileScheduler>,
+    frame_context_id: usize,
+}
+
+pub struct FrameContext<'a> {
+    id: usize,
+    pipeline: &'a mut Pipeline,
 }
 
 impl Pipeline {
     const DRAW_CALL_QUEUE_LEN: usize = 32;
     const DRAW_CALL_THREAD_COUNT: usize = 2;
 
-    pub fn new_with_framebuffer(fb: Framebuffer, tile_w: u32, tile_h: u32) -> Self {
+    pub fn new(width: u32, height: u32, tile_w: u32, tile_h: u32) -> Self {
+        let fb = Framebuffer::new(width, height);
         let width = fb.width();
         let height = fb.height();
         let mut threads = Vec::with_capacity(Self::DRAW_CALL_THREAD_COUNT);
@@ -720,11 +693,8 @@ impl Pipeline {
             draw_call_queue: draw_call_queue,
             draw_call_barrier: draw_call_barrier,
             tile_scheduler: tile_scheduler,
+            frame_context_id: 0,
         }
-    }
-
-    pub fn new(width: u32, height: u32, tile_w: u32, tile_h: u32) -> Self {
-        Self::new_with_framebuffer(Framebuffer::new(width, height), tile_w, tile_h)
     }
 
     pub fn stop(self) {
@@ -739,7 +709,8 @@ impl Pipeline {
         &self.framebuffer
     }
 
-    pub fn draw(
+    // Only called by FrameContext::draw()
+    fn draw(
         &self,
         mesh: VertexBuffer,
         vertex_shader: VertexShaderFn,
@@ -754,12 +725,43 @@ impl Pipeline {
         self.draw_call_queue.send(DrawCallCmd::Draw(cmd)).unwrap();
     }
 
-    pub fn begin_frame(&mut self) {
-        self.framebuffer.clear()
+    pub fn begin_frame<'a>(&'a mut self, color_buffer: &'a mut [u8]) -> FrameContext<'a> {
+        self.framebuffer.clear_depth();
+        unsafe {
+            std::ptr::write_bytes(color_buffer.as_mut_ptr(), 0, color_buffer.len());
+        }
+        self.tile_scheduler.set_framebuffer(Some(color_buffer));
+        self.frame_context_id += 1;
+        FrameContext {
+            id: self.frame_context_id,
+            pipeline: self,
+        }
     }
 
-    pub fn end_frame(&mut self) {
+    fn end_frame(&self, frame_context: &FrameContext) {
+        assert_eq!(frame_context.id, self.frame_context_id);
         self.draw_call_barrier.wait();
         self.tile_scheduler.wait();
+        self.tile_scheduler.set_framebuffer(None);
+    }
+}
+
+impl FrameContext<'_> {
+    pub fn draw(
+        &self,
+        mesh: VertexBuffer,
+        vertex_shader: VertexShaderFn,
+        frag_shader: FragShaderFn,
+    ) {
+        self.pipeline.draw(mesh, vertex_shader, frag_shader)
+    }
+
+    pub fn finish(self) {
+    }
+}
+
+impl Drop for FrameContext<'_> {
+    fn drop(&mut self) {
+        self.pipeline.end_frame(self);
     }
 }

@@ -70,25 +70,17 @@ fn main() -> Result<(), String> {
 
     let mut event_pump = sdl_context.event_pump().unwrap();
 
-    let mut surface = window.surface(&event_pump).unwrap();
+    let surface = window.surface(&event_pump).unwrap();
 
-    let surface_pitch = surface.pitch();
     println!(
         "Surface: pitch {}, rect {:?} {:?}",
-        surface_pitch,
+        surface.pitch(),
         surface.rect(),
         surface.pixel_format_enum()
     );
-
-    let framebuffer = swr::Framebuffer::new_with_color_buffer(
-        surface.without_lock_mut().unwrap(),
-        surface_pitch,
-        WIDTH,
-        HEIGHT,
-    );
     surface.finish();
 
-    let mut pipeline = swr::Pipeline::new_with_framebuffer(framebuffer, WIDTH / 32, HEIGHT / 32);
+    let mut pipeline = swr::Pipeline::new(WIDTH, HEIGHT, WIDTH / 32, HEIGHT / 32);
 
     let input = std::io::BufReader::new(std::fs::File::open("data/suzanne.obj").unwrap());
     let (verts, indices) = obj_to_swr(obj::load_obj(input).unwrap());
@@ -183,15 +175,17 @@ fn main() -> Result<(), String> {
         }); // TODO: optimize this later, we don't want to allocate on every frame?
 
         let begin_draw = Instant::now();
-        let surface = window.surface(&event_pump).unwrap();
-        pipeline.begin_frame();
+        let mut surface = window.surface(&event_pump).unwrap();
+        let mut surface2 = window.surface(&event_pump).unwrap();
+        let frame_context = pipeline.begin_frame(surface.without_lock_mut().unwrap());
 
-        pipeline.draw(mesh.clone(), vs.clone(), fs.clone());
+        frame_context.draw(mesh.clone(), vs.clone(), fs.clone());
 
-        pipeline.end_frame();
+        frame_context.finish();
+        surface.finish();
         draw_secs += begin_draw.elapsed().as_secs_f64();
 
-        surface.update_window();
+        //surface.update_window();
 
         frame_count += 1;
 
